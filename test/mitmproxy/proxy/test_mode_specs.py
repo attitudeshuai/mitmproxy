@@ -89,6 +89,27 @@ def test_parse_specific_modes():
     with pytest.raises(ValueError, match="invalid upstream proxy scheme"):
         ProxyMode.parse("upstream:dns://example.com")
 
+    # Multiple upstream proxy servers for health-based failover.
+    single = ProxyMode.parse("upstream:http://primary:8080")
+    assert single.servers == (("http", ("primary", 8080)),)
+    assert single.scheme == "http"
+    assert single.address == ("primary", 8080)
+
+    multi = ProxyMode.parse("upstream:http://primary:8080,https://backup:9090")
+    assert multi.servers == (
+        ("http", ("primary", 8080)),
+        ("https", ("backup", 9090)),
+    )
+    # scheme/address keep referring to the primary server.
+    assert multi.scheme == "http"
+    assert multi.address == ("primary", 8080)
+
+    with pytest.raises(ValueError, match="duplicate upstream proxy server"):
+        ProxyMode.parse("upstream:http://primary:8080,http://primary:8080")
+
+    with pytest.raises(ValueError, match="Invalid server specification"):
+        ProxyMode.parse("upstream:http://primary:8080,")
+
     with pytest.raises(ValueError, match="takes no arguments"):
         ProxyMode.parse("dns:invalid")
 

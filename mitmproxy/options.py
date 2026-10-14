@@ -116,6 +116,14 @@ class Options(optmanager.OptManager):
             is host specification in the form of "http[s]://host[:port]". For WireGuard mode, PATH may point to
             a file containing key material. If no such file exists, it will be created on startup.
 
+            In upstream proxy mode, multiple comma-separated specs may be given
+            ("upstream:SPEC1,SPEC2") to declare backup upstream proxy servers.
+            New connections automatically fail over to a healthy backup when an
+            upstream proxy becomes unavailable; see the `upstream_health_check`,
+            `upstream_failover_strategy`, `upstream_failover_threshold`,
+            `upstream_probe_interval` and `upstream_recovery` options to configure
+            health checking and the `upstream.status` command to inspect states.
+
             You may append `@listen_port` or `@listen_host:listen_port` to override `listen_host` or `listen_port` for
             a specific proxy mode. Features such as client playback will use the first mode to determine
             which upstream server to use.

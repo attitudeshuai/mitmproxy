@@ -8,6 +8,7 @@ from logging import WARNING
 
 import wsproto.handshake
 
+from ... import upstreams
 from ...context import Context
 from ...mode_specs import ReverseMode
 from ...mode_specs import UpstreamMode
@@ -944,6 +945,11 @@ class HttpLayer(layer.Layer):
         self.streams = {}
         self.command_sources = {}
         self.connections = {}
+        # Tracks which upstream proxy servers have already been tried for an
+        # ongoing connection establishment, keyed by the first waiting command.
+        self.upstream_attempts: dict[
+            GetHttpConnection, tuple[server_spec.ServerSpec, ...]
+        ] = {}
 
     def __repr__(self):
         return f"HttpLayer({self.mode.name}, conns: {len(self.connections)})"
@@ -1064,8 +1070,34 @@ class HttpLayer(layer.Layer):
         self.streams[stream_id] = HttpStream(ctx, stream_id)
         yield from self.event_to_child(self.streams[stream_id], events.Start())
 
+    def _active_upstream_mode(self) -> UpstreamMode | None:
+        """
+        Return the client's upstream proxy mode if upstream health handling is
+        active for it (multiple upstreams declared or health checks enabled),
+        otherwise `None`.
+        """
+        mode = self.context.client.proxy_mode
+        registry = self.context.upstreams
+        if (
+            registry is not None
+            and isinstance(mode, UpstreamMode)
+            and registry.is_active_for(mode.servers)
+        ):
+            return mode
+        return None
+
+    def _log_upstream_events(self) -> layer.CommandGenerator[None]:
+        registry = self.context.upstreams
+        assert registry is not None
+        for level, message in registry.drain_events():
+            yield commands.Log(message, level)
+
     def get_connection(
-        self, event: GetHttpConnection, *, reuse: bool = True
+        self,
+        event: GetHttpConnection,
+        *,
+        reuse: bool = True,
+        reselect_upstream: bool = True,
     ) -> layer.CommandGenerator[None]:
         # Do we already have a connection we can re-use?
         if reuse:
@@ -1112,6 +1144,25 @@ class HttpLayer(layer.Layer):
                 GetHttpConnectionCompleted(event, (None, self.context.server.error)),
             )
             return
+
+        mode = self._active_upstream_mode()
+        if reselect_upstream and mode is not None and event.via in mode.servers:
+            # Select a healthy upstream proxy before establishing anything.
+            registry = self.context.upstreams
+            assert registry is not None
+            chosen = registry.select(mode.servers)
+            yield from self._log_upstream_events()
+            if chosen is None and len(mode.servers) > 1:
+                # Every configured upstream proxy is unavailable, fail fast
+                # with a summary error instead of attempting dead connections.
+                err = registry.aggregate_error(mode.servers)
+                stream = self.command_sources.pop(event)
+                yield from self.event_to_child(
+                    stream, GetHttpConnectionCompleted(event, (None, err))
+                )
+                return
+            elif chosen is not None:
+                event.via = chosen
 
         context = self.context.fork()
 
@@ -1162,6 +1213,43 @@ class HttpLayer(layer.Layer):
         self, command: RegisterHttpConnection
     ) -> layer.CommandGenerator[None]:
         waiting = self.waiting_for_establishment.pop(command.connection)
+
+        mode = self._active_upstream_mode()
+        via = command.connection.via if isinstance(command.connection, Server) else None
+        if mode is not None and via is not None and via in mode.servers:
+            registry = self.context.upstreams
+            assert registry is not None
+            if command.err:
+                # Record the failed attempt against the upstream proxy that was
+                # actually used and check whether another server should take over.
+                registry.record(
+                    via,
+                    False,
+                    error=command.err,
+                    kind=upstreams.classify_failure(command.err),
+                )
+                attempted = self.upstream_attempts.get(waiting[0], ())
+                if via not in attempted:
+                    attempted = (*attempted, via)
+                next_via = registry.select(mode.servers, tried=attempted)
+                yield from self._log_upstream_events()
+                if next_via is not None:
+                    # Fail over: re-drive every waiting command through the
+                    # next upstream proxy without bothering the client stream.
+                    self.upstream_attempts[waiting[0]] = attempted
+                    self.connections.pop(command.connection, None)
+                    for cmd in waiting:
+                        cmd.via = next_via
+                        yield from self.get_connection(cmd, reselect_upstream=False)
+                    return
+                self.upstream_attempts.pop(waiting[0], None)
+                if len(mode.servers) > 1:
+                    # All upstreams exhausted, report one summary error.
+                    command.err = registry.aggregate_error(mode.servers)
+            else:
+                registry.record(via, True)
+                self.upstream_attempts.pop(waiting[0], None)
+                yield from self._log_upstream_events()
 
         reply: tuple[None, str] | tuple[Connection, None]
         if command.err:

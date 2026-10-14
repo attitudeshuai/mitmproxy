@@ -7,6 +7,15 @@
 
 ## Unreleased: mitmproxy next
 
+- Upstream proxy mode now accepts multiple comma-separated upstream proxy
+  servers (`--mode upstream:http://primary:8080,http://backup:8081`) with
+  health-based failover: connection, TLS and CONNECT failures are tracked per
+  server (available/degraded/unavailable), new connections automatically move
+  to a healthy backup and back, unhealthy servers are actively probed, and the
+  new `upstream.status`/`upstream.recover` commands and the
+  `upstream_health_check`, `upstream_probe_interval`,
+  `upstream_failover_threshold`, `upstream_failover_strategy` and
+  `upstream_recovery` options configure the behavior.
 - Fix the global `listen_port` option being applied to proxy modes that don't
   bind a port (e.g. `local`), which caused a "Cannot spawn multiple servers on
   the same address" error when enabling local capture.

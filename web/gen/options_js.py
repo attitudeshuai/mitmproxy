@@ -23,11 +23,15 @@ def _ts_type(t):
         return "string"
     if t is int:
         return "number"
+    if t is float:
+        return "number"
     if t == Sequence[str]:
         return "string[]"
     if t == str | None:
         return "string | undefined"
     if t == int | None:
+        return "number | undefined"
+    if t == float | None:
         return "number | undefined"
     raise RuntimeError(t)
 

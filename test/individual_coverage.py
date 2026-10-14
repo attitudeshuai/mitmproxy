@@ -54,7 +54,7 @@ async def main():
                     "-qq",
                     "--disable-pytest-warnings",
                     "--cov",
-                    str(f.with_suffix("")).replace("/", "."),
+                    f.with_suffix("").as_posix().replace("/", "."),
                     "--cov-fail-under",
                     "100",
                     "--cov-report",
@@ -92,7 +92,7 @@ async def main():
     for f in (root / "mitmproxy").glob("**/*.py"):
         f = f.relative_to(root)
 
-        if len(sys.argv) > 1 and sys.argv[1] not in str(f):
+        if len(sys.argv) > 1 and sys.argv[1] not in f.as_posix():
             continue
 
         if f.name == "__init__.py" and f.stat().st_size == 0:

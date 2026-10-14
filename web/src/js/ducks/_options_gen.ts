@@ -90,6 +90,11 @@ export interface OptionsState {
     udp_hosts: string[];
     upstream_auth: string | undefined;
     upstream_cert: boolean;
+    upstream_failover_strategy: string;
+    upstream_failover_threshold: number;
+    upstream_health_check: boolean;
+    upstream_probe_interval: number;
+    upstream_recovery: string;
     validate_inbound_headers: boolean;
     view_filter: string | undefined;
     view_order: string;
@@ -198,6 +203,11 @@ export const defaultState: OptionsState = {
     udp_hosts: [],
     upstream_auth: undefined,
     upstream_cert: true,
+    upstream_failover_strategy: "sequential",
+    upstream_failover_threshold: 3,
+    upstream_health_check: false,
+    upstream_probe_interval: 10.0,
+    upstream_recovery: "auto",
     validate_inbound_headers: true,
     view_filter: undefined,
     view_order: "time",

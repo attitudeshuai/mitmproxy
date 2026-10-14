@@ -13,7 +13,7 @@ filename = here / "../../mitmproxy/tools/web/web_columns.py"
 
 def extract_columns() -> list:
     # Read the Typescript file content
-    input_file_content = input_filename.read_text()
+    input_file_content = input_filename.read_text(encoding="utf-8")
 
     pattern = r"//\s*parsed by web/gen/web_columns\s*\n([\s\w,]+)"
 

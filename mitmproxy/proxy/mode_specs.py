@@ -30,6 +30,7 @@ from abc import ABCMeta
 from abc import abstractmethod
 from dataclasses import dataclass
 from functools import cache
+from typing import cast
 from typing import ClassVar
 from typing import Literal
 
@@ -211,15 +212,42 @@ class UpstreamMode(ProxyMode):
 
     description = "HTTP(S) proxy (upstream mode)"
     transport_protocol = TCP
-    scheme: Literal["http", "https"]
-    address: tuple[str, int]
+    servers: tuple[server_spec.ServerSpec, ...] = ()
+    """
+    The upstream proxy server(s) to forward connections to, in declaration order.
+    More than one server may be specified as a comma-separated list,
+    e.g. `upstream:http://primary:8080,http://backup:8081`. The first entry is
+    considered the primary upstream server.
+    """
 
     # noinspection PyDataclass
     def __post_init__(self) -> None:
-        scheme, self.address = server_spec.parse(self.data, default_scheme="http")
-        if scheme != "http" and scheme != "https":
-            raise ValueError("invalid upstream proxy scheme")
-        self.scheme = scheme
+        parsed: list[server_spec.ServerSpec] = []
+        for raw_spec in self.data.split(","):
+            spec = server_spec.parse(raw_spec, default_scheme="http")
+            if spec[0] != "http" and spec[0] != "https":
+                raise ValueError("invalid upstream proxy scheme")
+            if spec in parsed:
+                raise ValueError(
+                    f"duplicate upstream proxy server: {UpstreamMode.format_spec(spec)}"
+                )
+            parsed.append(spec)
+        object.__setattr__(self, "servers", tuple(parsed))
+
+    @property
+    def scheme(self) -> Literal["http", "https"]:
+        """The scheme of the primary upstream proxy server."""
+        return cast(Literal["http", "https"], self.servers[0][0])
+
+    @property
+    def address(self) -> tuple[str, int]:
+        """The address of the primary upstream proxy server."""
+        return self.servers[0][1]
+
+    @staticmethod
+    def format_spec(spec: server_spec.ServerSpec) -> str:
+        scheme, (host, port) = spec
+        return f"{scheme}://{host}:{port}"
 
 
 class ReverseMode(ProxyMode):

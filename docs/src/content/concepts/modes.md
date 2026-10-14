@@ -429,6 +429,32 @@ proxy mode. You could in theory chain multiple mitmproxy instances in a
 row, but that doesn't make any sense in practice (i.e. outside of our
 tests).
 
+### Multiple Upstreams and Failover
+
+You can declare multiple upstream proxy servers as a comma-separated list.
+The first entry is the primary server, the remaining entries are backups:
+
+```shell
+mitmdump --mode upstream:http://primary:8080,http://backup:8081
+```
+
+mitmproxy tracks connection, TLS handshake and HTTP CONNECT failures for each
+upstream proxy server and classifies it as *available*, *degraded* (failures
+below the threshold) or *unavailable*. When the active server becomes
+unavailable, new connections are automatically established via the next usable
+server; already established connections are not migrated. Use
+`upstream_failover_strategy` to choose between strict declaration order
+(`sequential`, the default) and failure-avoiding selection (`avoid-failures`),
+`upstream_failover_threshold` to set the number of consecutive failures that
+marks a server as unavailable, `upstream_probe_interval` to configure how
+often unhealthy servers are actively probed, and `upstream_recovery` to
+control whether connections move back automatically (`auto`, the default) or
+only after an explicit `upstream.recover` command (`manual`). Set
+`upstream_health_check=true` to enable health tracking with a single upstream
+as well. The `upstream.status` command shows each server's state, failure
+counts and most recent failure reason, and failover and recovery events are
+written to the event log.
+
 ## SOCKS Proxy
 
 ```shell

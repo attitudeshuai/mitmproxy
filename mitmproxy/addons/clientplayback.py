@@ -103,6 +103,9 @@ class ReplayHandler(server.ConnectionHandler):
 
         if options.mode and options.mode[0].startswith("upstream:"):
             self.layer = layers.HttpLayer(context, HTTPMode.upstream)
+            upstream_health = ctx.master.addons.get("upstreamhealth")
+            if upstream_health is not None:
+                context.upstreams = upstream_health.registry
         else:
             self.layer = layers.HttpLayer(context, HTTPMode.transparent)
         self.layer.connections[client] = MockServer(flow, context.fork())

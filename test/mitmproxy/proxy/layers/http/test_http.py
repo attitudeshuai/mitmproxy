@@ -1,4 +1,5 @@
 import gc
+from logging import INFO
 from logging import WARNING
 
 import pytest
@@ -8,6 +9,7 @@ from mitmproxy.connection import Server
 from mitmproxy.http import HTTPFlow
 from mitmproxy.http import Response
 from mitmproxy.proxy import layer
+from mitmproxy.proxy import upstreams
 from mitmproxy.proxy.commands import CloseConnection
 from mitmproxy.proxy.commands import Log
 from mitmproxy.proxy.commands import OpenConnection
@@ -29,6 +31,7 @@ from test.mitmproxy.proxy.tutils import Placeholder
 from test.mitmproxy.proxy.tutils import Playbook
 from test.mitmproxy.proxy.tutils import reply
 from test.mitmproxy.proxy.tutils import reply_next_layer
+from test.mitmproxy.proxy.tutils import StrMatching
 
 
 def test_http_proxy(tctx):
@@ -968,6 +971,259 @@ def test_upstream_proxy_ipv6(tctx):
         )
     )
     assert server().address == ("proxy", 8080)
+
+
+PRIMARY = ("http", ("primary", 8080))
+BACKUP = ("http", ("backup", 8081))
+
+
+def _upstream_registry(tctx, spec: str, **settings) -> upstreams.UpstreamRegistry:
+    registry = upstreams.UpstreamRegistry(upstreams.UpstreamSettings(**settings))
+    tctx.upstreams = registry
+    tctx.client.proxy_mode = ProxyMode.parse(spec)
+    return registry
+
+
+def test_upstream_failover_http(tctx):
+    """When the primary upstream is down, new connections transparently use the backup."""
+    primary = Placeholder(Server)
+    backup = Placeholder(Server)
+    registry = _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080,http://backup:8081",
+        failure_threshold=1,
+    )
+    playbook = Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+    assert (
+        playbook
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << OpenConnection(primary)
+        >> reply("[Errno 61] Connection refused")
+        << Log(StrMatching("primary:8080.*unavailable"), WARNING)
+        << Log(StrMatching("failover.*backup:8081"), WARNING)
+        << OpenConnection(backup)
+        >> reply(None)
+        << SendData(
+            backup,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        >> DataReceived(backup, b"HTTP/1.1 418 OK\r\nContent-Length: 0\r\n\r\n")
+        << SendData(tctx.client, b"HTTP/1.1 418 OK\r\nContent-Length: 0\r\n\r\n")
+    )
+    assert primary().address == ("primary", 8080)
+    assert backup().address == ("backup", 8081)
+    assert registry.status(PRIMARY).state is upstreams.UpstreamHealth.UNAVAILABLE
+    assert registry.status(BACKUP).state is upstreams.UpstreamHealth.AVAILABLE
+
+
+def test_upstream_all_unavailable_aggregate_error(tctx):
+    """When every upstream failed for one connection, a summary error is returned."""
+    primary = Placeholder(Server)
+    backup = Placeholder(Server)
+    flow = Placeholder(HTTPFlow)
+    registry = _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080,http://backup:8081",
+        failure_threshold=1,
+    )
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << OpenConnection(primary)
+        >> reply("primary boom")
+        << Log(StrMatching("primary:8080.*unavailable"), WARNING)
+        << Log(StrMatching("failover.*backup:8081"), WARNING)
+        << OpenConnection(backup)
+        >> reply("backup boom")
+        << Log(StrMatching("backup:8081.*unavailable"), WARNING)
+        << Log(StrMatching("All upstream proxy servers are unavailable"), WARNING)
+        << http.HttpErrorHook(flow)
+        >> reply()
+        << SendData(
+            tctx.client,
+            BytesMatching(
+                b"502 Bad Gateway.+Could not establish the connection.+primary boom.+backup boom"
+            ),
+        )
+        << CloseConnection(tctx.client)
+    )
+    assert registry.status(PRIMARY).last_error == "primary boom"
+    assert registry.status(BACKUP).last_error == "backup boom"
+
+
+def test_upstream_fast_fail_when_all_already_down(tctx):
+    """No connection is attempted once all upstreams are known to be unavailable."""
+    flow = Placeholder(HTTPFlow)
+    registry = _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080,http://backup:8081",
+        failure_threshold=1,
+    )
+    registry.record(PRIMARY, False, error="primary down")
+    registry.record(BACKUP, False, error="backup down")
+    registry.drain_events()
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << Log(StrMatching("All upstream proxy servers are unavailable"), WARNING)
+        << http.HttpErrorHook(flow)
+        >> reply()
+        << SendData(
+            tctx.client,
+            BytesMatching(b"502 Bad Gateway.+Could not establish the connection"),
+        )
+        << CloseConnection(tctx.client)
+    )
+
+
+def test_upstream_degraded_failure_still_fails_over(tctx):
+    """A degraded primary is retried via the backup for the current connection."""
+    primary = Placeholder(Server)
+    backup = Placeholder(Server)
+    registry = _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080,http://backup:8081",
+        failure_threshold=3,
+    )
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << OpenConnection(primary)
+        >> reply("flaky")
+        << Log(StrMatching("primary:8080.*degraded"), INFO)
+        << Log(StrMatching("failover.*backup:8081"), WARNING)
+        << OpenConnection(backup)
+        >> reply(None)
+        << SendData(
+            backup,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        >> DataReceived(backup, b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        << SendData(
+            tctx.client, b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+        )
+    )
+    assert registry.status(PRIMARY).state is upstreams.UpstreamHealth.DEGRADED
+    assert registry.status(PRIMARY).consecutive_failures == 1
+    assert registry.status(BACKUP).state is upstreams.UpstreamHealth.AVAILABLE
+
+
+def test_upstream_failover_connect(tctx):
+    """Failover also works for TLS-in-CONNECT upstream connections."""
+    primary = Placeholder(Server)
+    backup = Placeholder(Server)
+    registry = _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080,http://backup:8081",
+        failure_threshold=1,
+    )
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+        >> DataReceived(
+            tctx.client,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        )
+        << SendData(tctx.client, b"HTTP/1.1 200 Connection established\r\n\r\n")
+        >> DataReceived(tctx.client, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        << layer.NextLayerHook(Placeholder())
+        >> reply_next_layer(lambda ctx: http.HttpLayer(ctx, HTTPMode.transparent))
+        << OpenConnection(primary)
+        >> reply("primary unreachable")
+        << Log(StrMatching("primary:8080.*unavailable"), WARNING)
+        << Log(StrMatching("failover.*backup:8081"), WARNING)
+        << OpenConnection(backup)
+        >> reply(None)
+        << SendData(
+            backup,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        )
+        >> DataReceived(backup, b"HTTP/1.1 200 Connection established\r\n\r\n")
+        << SendData(backup, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        >> DataReceived(backup, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        << SendData(tctx.client, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    )
+    assert registry.status(PRIMARY).state is upstreams.UpstreamHealth.UNAVAILABLE
+    assert registry.status(BACKUP).state is upstreams.UpstreamHealth.AVAILABLE
+
+
+def test_upstream_custom_via_bypasses_registry(tctx):
+    """A via set by an addon that is not a declared upstream is used as-is."""
+    custom = Placeholder(Server)
+    flow = Placeholder(HTTPFlow)
+    _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080,http://backup:8081",
+        failure_threshold=1,
+    )
+    playbook = Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+    assert (
+        playbook
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << http.HttpRequestHook(flow)
+    )
+    flow().server_conn.via = ("http", ("other-proxy", 1234))
+    assert (
+        playbook
+        >> reply()
+        << OpenConnection(custom)
+        >> reply(None)
+        << SendData(
+            custom,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        >> DataReceived(custom, b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        << SendData(
+            tctx.client, b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+        )
+    )
+    assert custom().address == ("other-proxy", 1234)
+
+
+def test_upstream_single_server_legacy_error_text(tctx):
+    """With one server the original error text is preserved, even with health checks on."""
+    server = Placeholder(Server)
+    flow = Placeholder(HTTPFlow)
+    error_response = Placeholder(bytes)
+    _upstream_registry(
+        tctx,
+        "upstream:http://primary:8080",
+        enabled=True,
+        failure_threshold=1,
+    )
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.upstream), hooks=False)
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << OpenConnection(server)
+        >> reply("Connection failed")
+        << Log(StrMatching("primary:8080.*unavailable"), WARNING)
+        << Log(StrMatching("All upstream proxy servers are unavailable"), WARNING)
+        << http.HttpErrorHook(flow)
+        >> reply()
+        << SendData(tctx.client, error_response)
+        << CloseConnection(tctx.client)
+    )
+    # The legacy raw error is forwarded, the multi-upstream summary header is not added.
+    assert b"502 Bad Gateway" in error_response()
+    assert b"Connection failed" in error_response()
+    assert b"Could not establish the connection" not in error_response()
 
 
 @pytest.mark.parametrize("mode", ["regular", "upstream"])

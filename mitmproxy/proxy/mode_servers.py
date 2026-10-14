@@ -65,6 +65,13 @@ class ProxyConnectionHandler(server.LiveConnectionHandler):
         self.master = master
         super().__init__(r, w, options, mode)
         self.log_prefix = f"{human.format_address(self.client.peername)}: "
+        # Local import to avoid a dependency cycle between the proxy core and
+        # the addon package. If the addon is not loaded, health handling is off.
+        from mitmproxy.addons.upstream_health import UpstreamHealth
+
+        upstream_health = master.addons.get(UpstreamHealth.__name__.lower())
+        if upstream_health is not None:
+            self.layer.context.upstreams = upstream_health.registry
 
     async def handle_hook(self, hook: commands.StartHook) -> None:
         with self.timeout_watchdog.disarm():

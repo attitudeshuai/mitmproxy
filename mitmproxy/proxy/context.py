@@ -4,7 +4,8 @@ from mitmproxy import connection
 from mitmproxy.options import Options
 
 if TYPE_CHECKING:
-    import mitmproxy.proxy.layer
+    from mitmproxy.proxy.layer import Layer
+    from mitmproxy.proxy.upstreams import UpstreamRegistry
 
 
 class Context:
@@ -25,25 +26,34 @@ class Context:
     """
     Provides access to options for proxy layers. Not intended for use by addons, use `mitmproxy.ctx.options` instead.
     """
-    layers: list["mitmproxy.proxy.layer.Layer"]
+    layers: list["Layer"]
     """
     The protocol layer stack.
+    """
+
+    upstreams: "UpstreamRegistry | None"
+    """
+    Shared registry of upstream proxy server health, if the upstream health
+    addon is loaded. `None` means that upstream proxy mode behaves as before
+    without any health-based selection or failover.
     """
 
     def __init__(
         self,
         client: connection.Client,
         options: Options,
+        upstreams: "UpstreamRegistry | None" = None,
     ) -> None:
         self.client = client
         self.options = options
+        self.upstreams = upstreams
         self.server = connection.Server(
             address=None, transport_protocol=client.transport_protocol
         )
         self.layers = []
 
     def fork(self) -> "Context":
-        ret = Context(self.client, self.options)
+        ret = Context(self.client, self.options, self.upstreams)
         ret.server = self.server
         ret.layers = self.layers.copy()
         return ret

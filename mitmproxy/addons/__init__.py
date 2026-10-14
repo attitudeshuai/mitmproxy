@@ -29,6 +29,7 @@ from mitmproxy.addons import strip_dns_https_records
 from mitmproxy.addons import tlsconfig
 from mitmproxy.addons import update_alt_svc
 from mitmproxy.addons import upstream_auth
+from mitmproxy.addons import upstream_health
 
 
 def default_addons():
@@ -49,6 +50,7 @@ def default_addons():
         onboarding.Onboarding(),
         proxyauth.ProxyAuth(),
         proxyserver.Proxyserver(),
+        upstream_health.UpstreamHealth(),
         script.ScriptLoader(),
         dns_resolver.DnsResolver(),
         next_layer.NextLayer(),
