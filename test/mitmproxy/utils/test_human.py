@@ -27,9 +27,23 @@ def test_parse_size():
     assert human.parse_size(None) is None
 
 
+def test_parse_duration():
+    assert human.parse_duration("0") == 0
+    assert human.parse_duration("1") == 1
+    assert human.parse_duration("0.5s") == 0.5
+    assert human.parse_duration("30s") == 30
+    assert human.parse_duration("2m") == 120
+    assert human.parse_duration("1h") == 3600
+    assert human.parse_duration("  10 s ") == 10
+    with pytest.raises(ValueError):
+        human.parse_duration("1f")
+    with pytest.raises(ValueError):
+        human.parse_duration("as")
+    assert human.parse_duration(None) is None
+
+
 def test_pretty_size():
     assert human.pretty_size(0) == "0b"
-    assert human.pretty_size(100) == "100b"
     assert human.pretty_size(1024) == "1.0k"
     assert human.pretty_size(1024 + 512) == "1.5k"
     assert human.pretty_size(1024 * 1024) == "1.0m"

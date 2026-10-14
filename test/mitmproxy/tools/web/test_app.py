@@ -132,8 +132,10 @@ class TestApp(tornado.testing.AsyncHTTPTestCase):
     def test_flows(self):
         resp = self.fetch("/flows")
         assert resp.code == 200
-        assert get_json(resp)[0]["request"]["contentHash"]
-        assert get_json(resp)[2]["error"]
+        flows = get_json(resp)
+        assert flows[0]["request"]["contentHash"]
+        assert flows[2]["error"]
+        assert "intercept_timestamp" in flows[0]
 
     def test_flows_dump(self):
         resp = self.fetch("/flows/dump")

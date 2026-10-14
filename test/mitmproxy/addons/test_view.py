@@ -53,6 +53,35 @@ def test_order_generators_http():
     sz = view.OrderKeySize(v)
     assert sz.generate(tf) == len(tf.request.raw_content) + len(tf.response.raw_content)
 
+    wt = view.OrderInterceptWait(v)
+    assert wt.generate(tf) == float("inf")
+    tf.intercept()
+    tf.intercept_timestamp = 42
+    assert wt.generate(tf) == 42
+
+
+def test_order_intercept_wait():
+    v = view.View()
+    with taddons.context(v) as tctx:
+        tctx.configure(v, view_order="wait")
+        a = tft(start=1)
+        b = tft(start=2)
+        c = tft(start=3)
+        v.add([a, b, c])
+
+        a.intercept()
+        a.intercept_timestamp = 100
+        b.intercept()
+        b.intercept_timestamp = 50
+        v.update([a, b])
+        # The flow intercepted earlier (waiting longest) comes first.
+        assert list(v)[:2] == [b, a]
+
+        b.resume()
+        v.update([b])
+        assert list(v)[0] is a
+        assert b in list(v)[1:]
+
 
 def test_order_generators_dns():
     v = view.View()

@@ -96,7 +96,9 @@ class DNSLayer(layer.Layer):
     ) -> layer.CommandGenerator[None]:
         flow.response = msg
         yield DnsResponseHook(flow)
-        if flow.response:
+        if flow.error:
+            yield from self.handle_error(flow, flow.error.msg)
+        elif flow.response:
             packed = pack_message(flow.response, flow.client_conn.transport_protocol)
             yield commands.SendData(self.context.client, packed)
 

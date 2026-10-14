@@ -67,6 +67,31 @@ def test_simple(tctx):
     assert len(f().messages) == 2
 
 
+def test_kill_intercepted_message(tctx):
+    """A killed intercepted message must not be forwarded and connections close."""
+    f = Placeholder(UDPFlow)
+
+    def kill(flow: UDPFlow):
+        flow.kill()
+
+    assert (
+        Playbook(udp.UDPLayer(tctx))
+        << udp.UdpStartHook(f)
+        >> reply()
+        << OpenConnection(tctx.server)
+        >> reply(None)
+        >> DataReceived(tctx.client, b"hello!")
+        << udp.UdpMessageHook(f)
+        >> reply(side_effect=kill)
+        << udp.UdpErrorHook(f)
+        >> reply()
+        << CloseConnection(tctx.server)
+        << CloseConnection(tctx.client)
+    )
+    assert not f().live
+    assert f().error.msg == "Connection killed."
+
+
 def test_receive_data_before_server_connected(tctx):
     """
     assert that data received before a server connection is established

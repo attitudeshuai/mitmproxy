@@ -102,6 +102,44 @@ def test_regular(tctx, transport_protocol):
 
 
 @pytest.mark.parametrize("transport_protocol", ["tcp", "udp"])
+def test_response_killed(tctx, transport_protocol):
+    """A killed intercepted response must not be relayed, the client gets SERVFAIL."""
+    tctx.client.transport_protocol = transport_protocol
+    tctx.server.transport_protocol = transport_protocol
+
+    f = Placeholder(DNSFlow)
+    req = tdnsreq()
+    resp = tdnsresp()
+
+    def resolve(flow: DNSFlow):
+        req.timestamp = flow.request.timestamp
+        flow.response = resp
+
+    def kill(flow: DNSFlow):
+        flow.kill()
+
+    assert (
+        Playbook(dns.DNSLayer(tctx))
+        >> DataReceived(tctx.client, dns.pack_message(req, transport_protocol))
+        << dns.DnsRequestHook(f)
+        >> reply(side_effect=resolve)
+        << dns.DnsResponseHook(f)
+        >> reply(side_effect=kill)
+        << dns.DnsErrorHook(f)
+        >> reply()
+        << SendData(
+            tctx.client,
+            dns.pack_message(
+                req.fail(response_codes.SERVFAIL), tctx.client.transport_protocol
+            ),
+        )
+        >> ConnectionClosed(tctx.client)
+        << None
+    )
+    assert f().error.msg == "Connection killed."
+
+
+@pytest.mark.parametrize("transport_protocol", ["tcp", "udp"])
 def test_regular_mode_no_hook(tctx, transport_protocol):
     tctx.client.transport_protocol = transport_protocol
     tctx.server.transport_protocol = transport_protocol

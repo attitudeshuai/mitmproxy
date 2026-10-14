@@ -735,10 +735,90 @@ class TestHTTPFlow:
 
     def test_intercept(self):
         f = tflow()
-        f.intercept()
+        assert f.intercept_timestamp is None
+        assert f.intercept() is True
         assert f.intercepted
-        f.intercept()
+        assert f.intercept_timestamp is not None
+        assert f.intercept() is False
         assert f.intercepted
+
+    def test_intercept_resolution_manual(self):
+        f = tflow()
+        f.intercept()
+        started = f.intercept_timestamp
+        f.resume()
+        assert f.intercept_timestamp is None
+        history = f.metadata[flow.INTERCEPT_METADATA_KEY]
+        assert len(history) == 1
+        assert history[0]["action"] == flow.INTERCEPT_ACTION_FORWARD
+        assert history[0]["disposition"] == flow.INTERCEPT_DISPOSITION_MANUAL
+        assert history[0]["started_at"] == started
+        assert history[0]["wait_seconds"] >= 0
+        # Manual resolution does not annotate the comment.
+        assert f.comment == ""
+
+        # A second episode (e.g. the response is intercepted as well) is appended.
+        f.intercept()
+        f.kill()
+        history = f.metadata[flow.INTERCEPT_METADATA_KEY]
+        assert len(history) == 2
+        assert history[1]["action"] == flow.INTERCEPT_ACTION_KILL
+        assert history[1]["disposition"] == flow.INTERCEPT_DISPOSITION_MANUAL
+
+        # Killing a flow that was never intercepted is not recorded.
+        f = tflow()
+        f.kill()
+        assert flow.INTERCEPT_METADATA_KEY not in f.metadata
+
+    def test_intercept_resolution_timeout(self):
+        f = tflow()
+        f.intercept()
+        entry = f._resolve_interception(
+            flow.INTERCEPT_ACTION_KILL, flow.INTERCEPT_DISPOSITION_TIMEOUT
+        )
+        assert entry is not None
+        assert f.intercept_timestamp is None
+        # The subsequent kill on the same path must not record a second entry.
+        f.kill()
+        history = f.metadata[flow.INTERCEPT_METADATA_KEY]
+        assert len(history) == 1
+        assert history[0]["action"] == flow.INTERCEPT_ACTION_KILL
+        assert history[0]["disposition"] == flow.INTERCEPT_DISPOSITION_TIMEOUT
+        assert "[intercept timeout]" in f.comment
+        assert "Killed" in f.comment
+
+        f = tflow()
+        f.intercept()
+        f._resolve_interception(
+            flow.INTERCEPT_ACTION_FORWARD, flow.INTERCEPT_DISPOSITION_TIMEOUT
+        )
+        f.resume()
+        assert "Forwarded" in f.comment
+        assert len(f.metadata[flow.INTERCEPT_METADATA_KEY]) == 1
+
+        # Existing comments are preserved.
+        f = tflow()
+        f.comment = "user note"
+        f.intercept()
+        f._resolve_interception(
+            flow.INTERCEPT_ACTION_FORWARD, flow.INTERCEPT_DISPOSITION_TIMEOUT
+        )
+        assert f.comment.startswith("user note")
+        assert "[intercept timeout]" in f.comment
+
+    async def test_kill_unblocks_wait_for_resume(self):
+        f = tflow()
+        f.intercept()
+
+        async def kill_soon():
+            await asyncio.sleep(0.05)
+            f.kill()
+
+        task = asyncio.ensure_future(kill_soon())
+        await asyncio.wait_for(f.wait_for_resume(), timeout=1)
+        await task
+        assert not f.intercepted
+        assert f.error.msg == flow.Error.KILLED_MESSAGE
 
     def test_resume(self):
         f = tflow()

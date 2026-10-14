@@ -271,6 +271,29 @@ def test_drop_message(ws_testdata):
     assert playbook
 
 
+def test_kill_message(ws_testdata):
+    tctx, playbook, flow = ws_testdata
+    flow.live = True
+
+    def kill(f: HTTPFlow):
+        f.kill()
+
+    assert (
+        playbook
+        << websocket.WebsocketStartHook(flow)
+        >> reply()
+        >> DataReceived(tctx.server, b"\x81\x03foo")
+        << websocket.WebsocketMessageHook(flow)
+        >> reply(side_effect=kill)
+        << CloseConnection(tctx.server)
+        << CloseConnection(tctx.client)
+        << websocket.WebsocketEndHook(flow)
+        >> reply()
+    )
+    assert not flow.live
+    assert flow.error.msg == "Connection killed."
+
+
 def test_fragmented(ws_testdata):
     tctx, playbook, flow = ws_testdata
     assert (

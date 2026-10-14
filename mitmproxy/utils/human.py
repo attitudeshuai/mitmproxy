@@ -11,6 +11,12 @@ SIZE_UNITS = {
     "t": 1024**4,
 }
 
+DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 60 * 60,
+}
+
 
 def pretty_size(size: int) -> str:
     """Convert a number of bytes into a human-readable string.
@@ -48,6 +54,28 @@ def parse_size(s: str | None) -> int | None:
             except ValueError:
                 break
     raise ValueError("Invalid size specification.")
+
+
+@functools.lru_cache
+def parse_duration(s: str | None) -> float | None:
+    """
+    Parse a duration in seconds with an optional s/m/h suffix.
+    Invalid values raise a ValueError. For added convenience, passing `None` returns `None`.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    for suffix, factor in DURATION_UNITS.items():
+        if s.endswith(suffix):
+            try:
+                return float(s[:-1].strip()) * factor
+            except ValueError:
+                break
+    raise ValueError("Invalid duration specification.")
 
 
 def pretty_duration(secs: float | None) -> str:

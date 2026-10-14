@@ -28,6 +28,7 @@ export function THTTPFlow(): Required<HTTPFlow> {
             "timestamp": 946681207.0
         },
         "id": "d91165be-ca1f-4612-88a9-c0f8696f3e29",
+        "intercept_timestamp": undefined,
         "intercepted": false,
         "is_replay": undefined,
         "marked": "",
@@ -188,6 +189,7 @@ export function TTCPFlow(): Required<TCPFlow> {
             "timestamp": 946681207.0
         },
         "id": "2ea7012b-21b5-4f8f-98cd-d49819954001",
+        "intercept_timestamp": undefined,
         "intercepted": false,
         "is_replay": undefined,
         "marked": "",
@@ -254,6 +256,7 @@ export function TUDPFlow(): Required<UDPFlow> {
             "timestamp": 946681207.0
         },
         "id": "f9f7b2b9-7727-4477-822d-d3526e5b8951",
+        "intercept_timestamp": undefined,
         "intercepted": false,
         "is_replay": undefined,
         "marked": "",
@@ -320,6 +323,7 @@ export function TDNSFlow(): Required<DNSFlow> {
             "timestamp": 946681207.0
         },
         "id": "5434da94-1017-42fa-872d-a189508d48e4",
+        "intercept_timestamp": undefined,
         "intercepted": false,
         "is_replay": undefined,
         "marked": "",

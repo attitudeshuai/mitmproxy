@@ -2,6 +2,7 @@
     {
         "id": "hardcoded_for_test",
         "intercepted": false,
+        "intercept_timestamp": null,
         "is_replay": null,
         "type": "http",
         "modified": false,

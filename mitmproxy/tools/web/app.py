@@ -89,6 +89,7 @@ def flow_to_json(flow: mitmproxy.flow.Flow) -> dict:
     f = {
         "id": flow.id,
         "intercepted": flow.intercepted,
+        "intercept_timestamp": flow.intercept_timestamp,
         "is_replay": flow.is_replay,
         "type": flow.type,
         "modified": flow.modified(),

@@ -9,6 +9,7 @@ from wsproto import ConnectionState
 from wsproto.frame_protocol import Opcode
 
 from mitmproxy import connection
+from mitmproxy import flow
 from mitmproxy import http
 from mitmproxy import websocket
 from mitmproxy.proxy import commands
@@ -185,6 +186,17 @@ class WebsocketLayer(layer.Layer):
                     )
                     self.flow.websocket.messages.append(message)
                     yield WebsocketMessageHook(self.flow)
+
+                    if (
+                        self.flow.error
+                        and self.flow.error.msg == flow.Error.KILLED_MESSAGE
+                    ):
+                        self.flow.live = False
+                        for ws in [self.server_ws, self.client_ws]:
+                            yield commands.CloseConnection(ws.conn)
+                        yield WebsocketEndHook(self.flow)
+                        self._handle_event = self.done
+                        return
 
                     if not message.dropped:
                         for msg in fragmentizer(message.content):

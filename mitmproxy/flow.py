@@ -13,6 +13,14 @@ from mitmproxy import connection
 from mitmproxy import exceptions
 from mitmproxy import version
 from mitmproxy.coretypes import serializable
+from mitmproxy.utils import human
+
+# Metadata key under which interception episodes are recorded on each flow.
+INTERCEPT_METADATA_KEY = "intercept_history"
+INTERCEPT_ACTION_FORWARD = "forward"
+INTERCEPT_ACTION_KILL = "kill"
+INTERCEPT_DISPOSITION_MANUAL = "manual"
+INTERCEPT_DISPOSITION_TIMEOUT = "timeout"
 
 
 @dataclass
@@ -74,6 +82,16 @@ class Flow(serializable.Serializable):
     We're waiting for a user action to forward the flow to its destination.
     """
 
+    intercept_timestamp: float | None
+    """
+    Unix timestamp of when the flow entered its current interception, or `None`.
+
+    This is a runtime-only attribute: It is set by `intercept()`, cleared once the
+    interception is resolved (resume, kill, or timeout), and not persisted in flow
+    files. Past interception episodes with their wait time and disposition are
+    recorded under the `intercept_history` metadata key.
+    """
+
     marked: str = ""
     """
     If this attribute is a non-empty string the flow has been marked by the user.
@@ -122,6 +140,7 @@ class Flow(serializable.Serializable):
         self.timestamp_created = time.time()
 
         self.intercepted: bool = False
+        self.intercept_timestamp: float | None = None
         self._resume_event: asyncio.Event | None = None
         self._backup: Flow | None = None
         self.marked: str = ""
@@ -237,20 +256,62 @@ class Flow(serializable.Serializable):
         #  flows in transit (https://github.com/mitmproxy/mitmproxy/issues/4711), even though they are advertised
         #  as killable. An alternative approach would be to introduce a `KillInjected` event similar to
         #  `MessageInjected`, which should fix this issue.
+        self._resolve_interception(INTERCEPT_ACTION_KILL, INTERCEPT_DISPOSITION_MANUAL)
         self.error = Error(Error.KILLED_MESSAGE)
         self.intercepted = False
         self.live = False
+        # Release a connection handler that may be blocked in wait_for_resume() so
+        # that the layers below can observe the kill and close the connection.
+        if self._resume_event is not None:
+            self._resume_event.set()
 
-    def intercept(self):
+    def intercept(self) -> bool:
         """
         Intercept this Flow. Processing will stop until resume is
         called.
+
+        Returns `True` if the flow has been newly intercepted, `False` if it
+        was already waiting for a decision.
         """
         if self.intercepted:
-            return
+            return False
         self.intercepted = True
+        self.intercept_timestamp = time.time()
         if self._resume_event is not None:
             self._resume_event.clear()
+        return True
+
+    def _resolve_interception(
+        self, action: str, disposition: str
+    ) -> dict[str, Any] | None:
+        """
+        Close the current interception episode and record how long it took and
+        how it was resolved. This is idempotent per episode and a no-op if the
+        flow is not currently intercepted. Timeout-triggered resolutions also
+        leave a comment so that they can be spotted in the flow list and filtered
+        with `~comment "intercept timeout"`.
+        """
+        started = self.intercept_timestamp
+        if started is None:
+            return None
+        ended = time.time()
+        entry: dict[str, Any] = {
+            "started_at": started,
+            "ended_at": ended,
+            "wait_seconds": ended - started,
+            "action": action,
+            "disposition": disposition,
+        }
+        self.metadata.setdefault(INTERCEPT_METADATA_KEY, []).append(entry)
+        self.intercept_timestamp = None
+        if disposition == INTERCEPT_DISPOSITION_TIMEOUT:
+            verb = "Forwarded" if action == INTERCEPT_ACTION_FORWARD else "Killed"
+            line = (
+                f"[intercept timeout] {verb} after "
+                f"{human.pretty_duration(entry['wait_seconds'])}."
+            )
+            self.comment = f"{self.comment}\n{line}" if self.comment else line
+        return entry
 
     async def wait_for_resume(self):
         """
@@ -268,6 +329,9 @@ class Flow(serializable.Serializable):
         """
         if not self.intercepted:
             return
+        self._resolve_interception(
+            INTERCEPT_ACTION_FORWARD, INTERCEPT_DISPOSITION_MANUAL
+        )
         self.intercepted = False
         if self._resume_event is not None:
             self._resume_event.set()

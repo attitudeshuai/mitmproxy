@@ -129,11 +129,22 @@ class OrderKeySize(_OrderKey):
             raise NotImplementedError()
 
 
+class OrderInterceptWait(_OrderKey):
+    def generate(self, f: mitmproxy.flow.Flow) -> float:
+        # Currently intercepted flows are ordered by the time they entered
+        # interception, so the flows that have been waiting longest come first.
+        # Everything else sinks to the bottom.
+        if f.intercepted and f.intercept_timestamp is not None:
+            return f.intercept_timestamp
+        return float("inf")
+
+
 orders = [
     ("t", "time"),
     ("m", "method"),
     ("u", "url"),
     ("z", "size"),
+    ("w", "wait"),
 ]
 
 
@@ -159,6 +170,7 @@ class View(collections.abc.Sequence):
             method=OrderRequestMethod(self),
             url=OrderRequestURL(self),
             size=OrderKeySize(self),
+            wait=OrderInterceptWait(self),
         )
         self.order_key: _OrderKey = self.default_order
         self.order_reversed = False

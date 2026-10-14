@@ -114,6 +114,16 @@ class UDPLayer(layer.Layer):
                 udp_message = udp.UDPMessage(from_client, event.data)
                 self.flow.messages.append(udp_message)
                 yield UdpMessageHook(self.flow)
+                if (
+                    self.flow.error
+                    and self.flow.error.msg == flow.Error.KILLED_MESSAGE
+                ):
+                    self.flow.live = False
+                    yield UdpErrorHook(self.flow)
+                    yield commands.CloseConnection(self.context.server)
+                    yield commands.CloseConnection(self.context.client)
+                    self._handle_event = self.done
+                    return
                 yield commands.SendData(send_to, udp_message.content)
             else:
                 yield commands.SendData(send_to, event.data)
