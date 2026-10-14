@@ -7,6 +7,12 @@
 
 ## Unreleased: mitmproxy next
 
+- Add a configurable cache for DNS responses in regular DNS mode/wireguard mode
+  (`dns_cache`), with TTL bounds (`dns_cache_ttl_min`, `dns_cache_ttl_max`),
+  negative caching for NXDOMAIN/SERVFAIL (`dns_cache_negative_ttl`), LRU
+  eviction (`dns_cache_size`), stale answers on upstream failure
+  (`dns_cache_stale`), in-flight query coalescing, and the `dns.cache.stats`
+  and `dns.cache.clear` commands.
 - Fix the global `listen_port` option being applied to proxy modes that don't
   bind a port (e.g. `local`), which caused a "Cannot spawn multiple servers on
   the same address" error when enabling local capture.
