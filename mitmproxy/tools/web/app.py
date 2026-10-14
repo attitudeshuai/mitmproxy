@@ -809,7 +809,10 @@ class Options(RequestHandler):
     def put(self):
         update = self.json
         try:
-            self.master.options.update(**update)
+            self.master.options.update(
+                _source=optmanager.Source(optmanager.SOURCE_RUNTIME, "web interface"),
+                **update,
+            )
         except Exception as err:
             raise APIError(400, f"{err}")
 

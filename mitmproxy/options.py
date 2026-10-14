@@ -74,6 +74,7 @@ class Options(optmanager.OptManager):
             Note that passing cert_passphrase on the command line makes your passphrase visible in your system's
             process list. Specify it in config.yaml to avoid this.
             """,
+            sensitive=True,
         )
         self.add_option(
             "client_certs", Optional[str], None, "Client certificate file or directory."

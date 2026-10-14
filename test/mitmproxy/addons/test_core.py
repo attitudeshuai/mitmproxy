@@ -156,6 +156,30 @@ def test_options(tmpdir):
             sa.options_load(p)
 
 
+def test_options_sources():
+    sa = core.Core()
+    with taddons.context() as tctx:
+        tctx.command(sa.set, "listen_host", "foo.example")
+        full = sa.options_sources()
+        assert "listen_host" in full
+        assert "foo.example" in full
+        assert "Summary:" in full
+        assert "Effective source: set set command" in full
+
+        single = sa.options_sources("listen_host")
+        assert "foo.example" in single
+        assert "Summary:" not in single
+
+        with pytest.raises(exceptions.CommandError):
+            sa.options_sources("nonexistent")
+
+        # Credential values are never echoed, only their presence.
+        tctx.command(sa.set, "cert_passphrase", "topsecret")
+        report = sa.options_sources("cert_passphrase")
+        assert "topsecret" not in report
+        assert "[set]" in report
+
+
 def test_validation_simple():
     sa = core.Core()
     with taddons.context() as tctx:

@@ -7,6 +7,14 @@
 
 ## Unreleased: mitmproxy next
 
+- Track the source of every option value (built-in default, config file,
+  command-line flag, `set` instruction or runtime change), retain overridden
+  values and the override reason, and add a read-only `options.sources`
+  command plus `OptManager.source_info()` / `optmanager.dump_sources()`
+  diagnostics showing the effective value and source per key, including a
+  summary of default-valued keys and multi-source disagreements. Credential
+  options (`cert_passphrase`, `proxyauth`, `upstream_auth`) are only reported
+  as set or not set, never with their value.
 - Fix the global `listen_port` option being applied to proxy modes that don't
   bind a port (e.g. `local`), which caused a "Cannot spawn multiple servers on
   the same address" error when enabling local capture.

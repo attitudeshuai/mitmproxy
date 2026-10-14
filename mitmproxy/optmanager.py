@@ -27,8 +27,131 @@ from mitmproxy.utils import typecheck
 unset = object()
 
 
+# ---------------------------------------------------------------------------
+# Value source tracking
+# ---------------------------------------------------------------------------
+#
+# Every assignment to an option is tagged with a Source describing where the
+# value came from. The full assignment history is retained on the option so
+# that the diagnostic report can explain which sources overrode which.
+
+SOURCE_DEFAULT = "default"
+SOURCE_CONFIG_FILE = "config-file"
+SOURCE_COMMAND_LINE = "command-line"
+SOURCE_SET = "set"
+SOURCE_RUNTIME = "runtime"
+
+SOURCE_LABELS = {
+    SOURCE_DEFAULT: "default",
+    SOURCE_CONFIG_FILE: "config file",
+    SOURCE_COMMAND_LINE: "command-line",
+    SOURCE_SET: "set",
+    SOURCE_RUNTIME: "runtime",
+}
+
+# Assignments take effect in the order in which they physically happen, so
+# tracking is a linear history rather than fixed precedence layers (at
+# startup --set happens first, then config files, then command-line flags,
+# but at runtime any source can write at any time). Only runtime writes can
+# be "undone": a runtime write whose value restores the value from before
+# the contiguous run of runtime modifications is recorded as a revert and
+# the effective source falls back to that earlier source.
+
+
+@dataclass(frozen=True)
+class Source:
+    """
+    The origin of an option value. ``location`` gives a human-readable pointer
+    such as a config file path or the name of the command-line flag.
+    """
+
+    category: str
+    location: str | None = None
+
+    def describe(self) -> str:
+        label = SOURCE_LABELS.get(self.category, self.category)
+        if self.location:
+            return f"{label} {self.location}"
+        return label
+
+
+@dataclass(frozen=True)
+class SourceEvent:
+    """
+    A single assignment to an option. Events are kept in assignment order so
+    that diagnostics can show the override chain and the value that each
+    source replaced.
+    """
+
+    source: Source
+    value: Any
+    seq: int
+    reverted: bool = False
+
+
+def _visible_window(o: "_Option") -> list[SourceEvent]:
+    """Source events since the option's last reset, in assignment order."""
+    window: list[SourceEvent] = []
+    for ev in o.events:
+        if ev.source.category == SOURCE_DEFAULT:
+            # A reset starts a fresh window; older history is retained but
+            # not part of the current picture.
+            window = []
+        else:
+            window.append(ev)
+    return window
+
+
+def _replay_effective(window: Sequence[SourceEvent]) -> SourceEvent | None:
+    """
+    Determine the currently effective event by replaying the visible window.
+    Returns None when the built-in default is in effect. A reverted runtime
+    event pops the contiguous run of runtime modifications on top of it and
+    points back at the earlier non-runtime source that held the value.
+    """
+    effective: SourceEvent | None = None
+    for idx, ev in enumerate(window):
+        if not ev.reverted:
+            effective = ev
+            continue
+        j = idx - 1
+        while j >= 0 and window[j].source.category == SOURCE_RUNTIME:
+            j -= 1
+        effective = window[j] if j >= 0 else None
+    return effective
+
+
+def _runtime_baseline(window: Sequence[SourceEvent], default: Any) -> Any:
+    """
+    The value a new runtime write is compared against: the value of the
+    nearest non-runtime event before the trailing run of runtime writes, or
+    the default when there is none.
+    """
+    j = len(window) - 1
+    while j >= 0 and window[j].source.category == SOURCE_RUNTIME:
+        j -= 1
+    return window[j].value if j >= 0 else default
+
+
+def _distinct_values(values: Iterable[Any]) -> list[Any]:
+    out: list[Any] = []
+    for v in values:
+        if not any(v == other for other in out):
+            out.append(v)
+    return out
+
+
 class _Option:
-    __slots__ = ("name", "typespec", "value", "_default", "choices", "help")
+    __slots__ = (
+        "name",
+        "typespec",
+        "value",
+        "_default",
+        "choices",
+        "help",
+        "sensitive",
+        "events",
+    )
 
     def __init__(
         self,
@@ -37,6 +160,7 @@ class _Option:
         default: Any,
         help: str,
         choices: Sequence[str] | None,
+        sensitive: bool = False,
     ) -> None:
         typecheck.check_option_type(name, default, typespec)
         self.name = name
@@ -45,6 +169,8 @@ class _Option:
         self.value = unset
         self.help = textwrap.dedent(help).strip().replace("\n", " ")
         self.choices = choices
+        self.sensitive = sensitive
+        self.events: list[SourceEvent] = []
 
     def __repr__(self):
         return f"{self.current()} [{self.typespec}]"
@@ -71,15 +197,30 @@ class _Option:
         return self.current() != self.default
 
     def __eq__(self, other) -> bool:
-        for i in self.__slots__:
-            if getattr(self, i) != getattr(other, i):
-                return False
-        return True
+        # Source history is diagnostic metadata and does not participate in
+        # option equality.
+        return (
+            self.name == other.name
+            and self.typespec == other.typespec
+            and self._default == other._default
+            and self.value == other.value
+            and self.choices == other.choices
+            and self.help == other.help
+            and self.sensitive == other.sensitive
+        )
 
     def __deepcopy__(self, _):
-        o = _Option(self.name, self.typespec, self.default, self.help, self.choices)
+        o = _Option(
+            self.name,
+            self.typespec,
+            self.default,
+            self.help,
+            self.choices,
+            self.sensitive,
+        )
         if self.has_changed():
             o.value = self.current()
+        o.events = copy.deepcopy(self.events)
         return o
 
 
@@ -111,10 +252,15 @@ class OptManager:
 
     def __init__(self) -> None:
         self.deferred: dict[str, Any] = {}
+        # Sources of the values in ``deferred``. ``deferred`` keeps its
+        # historical format, the source metadata is kept separately.
+        self._deferred_sources: dict[str, Source] = {}
         self.changed = signals.SyncSignal(_sig_changed_spec)
         self.changed.connect(self._notify_subscribers)
         self.errored = signals.SyncSignal(_sig_errored_spec)
         self._subscriptions: list[tuple[weakref.ref[Callable], set[str]]] = []
+        # Monotonic counter that orders source events across all options.
+        self._source_seq: int = 0
         # Options must be the last attribute here - after that, we raise an
         # error for attribute assignment to unknown options.
         self._options: dict[str, Any] = {}
@@ -126,9 +272,41 @@ class OptManager:
         default: Any,
         help: str,
         choices: Sequence[str] | None = None,
+        sensitive: bool = False,
     ) -> None:
-        self._options[name] = _Option(name, typespec, default, help, choices)
+        self._options[name] = _Option(name, typespec, default, help, choices, sensitive)
         self.changed.send(updated={name})
+
+    def _next_source_seq(self) -> int:
+        seq = self._source_seq
+        # Bypass __setattr__, which routes unknown attributes through update().
+        self.__dict__["_source_seq"] = seq + 1
+        return seq
+
+    def _assign(self, name: str, value: Any, source: Source) -> None:
+        """
+        Physically set an option and append a source event. A runtime write
+        that restores the value from before the current run of runtime
+        modifications is recorded as a revert instead, so the effective
+        source falls back to what it was before the run.
+        """
+        o = self._options[name]
+        # Type-check before recording, so a rejected value leaves no trace.
+        o.set(value)
+        reverted = False
+        if source.category == SOURCE_RUNTIME:
+            window = _visible_window(o)
+            baseline = _runtime_baseline(window, o._default)
+            if baseline == value:
+                reverted = True
+        o.events.append(
+            SourceEvent(
+                source,
+                copy.deepcopy(value),
+                self._next_source_seq(),
+                reverted,
+            )
+        )
 
     @contextlib.contextmanager
     def rollback(self, updated, reraise=False):
@@ -212,16 +390,35 @@ class OptManager:
 
     def reset(self):
         """
-        Restore defaults for all options.
+        Restore defaults for all options. Source tracking itself is not
+        cleared - the reset is recorded and every option's source returns to
+        the built-in default category.
         """
         for o in self._options.values():
             o.reset()
+            o.events.append(
+                SourceEvent(
+                    Source(SOURCE_DEFAULT, "reset"),
+                    copy.deepcopy(o._default),
+                    self._next_source_seq(),
+                )
+            )
         self.changed.send(updated=set(self._options.keys()))
 
-    def update_known(self, **kwargs):
+    def update_known(
+        self,
+        *,
+        _source: Source | None = None,
+        _sources: dict[str, Source] | None = None,
+        **kwargs,
+    ):
         """
         Update and set all known options from kwargs. Returns a dictionary
         of unknown options.
+
+        ``_source`` tags the whole batch, ``_sources`` tags individual keys
+        (taking precedence). Untagged writes are attributed to runtime
+        modifications. Both are internal keyword-only parameters.
         """
         known, unknown = {}, {}
         for k, v in kwargs.items():
@@ -233,16 +430,27 @@ class OptManager:
         if updated:
             with self.rollback(updated, reraise=True):
                 for k, v in known.items():
-                    self._options[k].set(v)
+                    source = (
+                        (_sources or {}).get(k) or _source or Source(SOURCE_RUNTIME)
+                    )
+                    self._assign(k, v, source)
                 self.changed.send(updated=updated)
         return unknown
 
-    def update_defer(self, **kwargs):
-        unknown = self.update_known(**kwargs)
+    def update_defer(self, *, _source: Source | None = None, **kwargs):
+        unknown = self.update_known(_source=_source, **kwargs)
         self.deferred.update(unknown)
+        for k in unknown:
+            self._deferred_sources[k] = _source or Source(SOURCE_RUNTIME)
 
-    def update(self, **kwargs):
-        u = self.update_known(**kwargs)
+    def update(
+        self,
+        *,
+        _source: Source | None = None,
+        _sources: dict[str, Source] | None = None,
+        **kwargs,
+    ):
+        u = self.update_known(_source=_source, _sources=_sources, **kwargs)
         if u:
             raise KeyError("Unknown options: %s" % ", ".join(u.keys()))
 
@@ -284,6 +492,121 @@ class OptManager:
         """
         return self._options[option].has_changed()
 
+    def source_info(self, option: str) -> dict[str, Any]:
+        """
+        A read-only diagnostic snapshot for one option. It contains the
+        effective value and source, every source in the override chain
+        (including overridden values and why they were overridden), and
+        summary flags for multi-source disagreements.
+        """
+        if option not in self._options:
+            raise KeyError("No such option: %s" % option)
+        o = self._options[option]
+        window = _visible_window(o)
+        effective_event = _replay_effective(window)
+        at_default = effective_event is None
+
+        def make_row(
+            source: Source,
+            value: Any,
+            *,
+            is_effective: bool,
+            reverted: bool,
+            reason: str | None,
+        ) -> dict[str, Any]:
+            row: dict[str, Any] = {
+                "category": source.category,
+                "location": source.location,
+                "reverted": reverted,
+                "reason": reason,
+            }
+            if o.sensitive:
+                row["sensitive"] = True
+                # Credentials are never echoed; only their presence is shown.
+                row["set"] = value is not None
+            else:
+                row["value"] = copy.deepcopy(value)
+            if is_effective:
+                row["effective"] = True
+            return row
+
+        rows: list[dict[str, Any]] = []
+        default_reason = (
+            None if at_default else f"overridden by {window[0].source.describe()}"
+        )
+        rows.append(
+            make_row(
+                Source(SOURCE_DEFAULT),
+                o._default,
+                is_effective=at_default,
+                reverted=False,
+                reason=default_reason,
+            )
+        )
+
+        for i, ev in enumerate(window):
+            if ev is effective_event:
+                reason = None
+            elif ev.reverted:
+                j = i - 1
+                while j >= 0 and window[j].source.category == SOURCE_RUNTIME:
+                    j -= 1
+                fallback = (
+                    window[j].source.describe()
+                    if j >= 0
+                    else SOURCE_LABELS[SOURCE_DEFAULT]
+                )
+                reason = f"runtime modification reverted; fell back to {fallback}"
+            else:
+                # The directly following assignment physically replaced this
+                # one. The last non-reverted event is always effective.
+                next_ev = window[i + 1]
+                reason = f"overridden by {next_ev.source.describe()}"
+            rows.append(
+                make_row(
+                    ev.source,
+                    ev.value,
+                    is_effective=ev is effective_event,
+                    reverted=ev.reverted,
+                    reason=reason,
+                )
+            )
+
+        # "Multiple sources" counts explicit assignments; the built-in
+        # default is the baseline, not a competing source. Sources disagree
+        # when their values differ - explicit sources providing identical
+        # values are listed but not counted as a conflict.
+        source_ids = {(ev.source.category, ev.source.location) for ev in window}
+        multiple_sources = len(source_ids) > 1
+        conflict = len(_distinct_values([ev.value for ev in window])) > 1
+
+        if o.sensitive:
+            effective_value: Any = {
+                "sensitive": True,
+                "set": o.current() is not None,
+            }
+        else:
+            # Take the value straight from the option so that the report can
+            # never disagree with the value actually in effect.
+            effective_value = o.current()
+
+        return {
+            "name": option,
+            "sensitive": o.sensitive,
+            "effective_value": effective_value,
+            "effective_source": (
+                effective_event.source if effective_event else Source(SOURCE_DEFAULT)
+            ),
+            "at_default": at_default,
+            "multiple_sources": multiple_sources,
+            "conflict": conflict,
+            "sources": rows,
+        }
+
+    def source_infos(self) -> dict[str, dict[str, Any]]:
+        """Read-only diagnostic snapshots for all options, keyed by name."""
+        return {k: self.source_info(k) for k in sorted(self._options)}
+
     def merge(self, opts):
         """
         Merge a dict of options into this object. Options that have None
@@ -307,7 +630,12 @@ class OptManager:
             mod=type(self).__module__, cls=type(self).__name__, options=options
         )
 
-    def set(self, *specs: str, defer: bool = False) -> None:
+    def set(
+        self,
+        *specs: str,
+        defer: bool = False,
+        _source: Source | None = None,
+    ) -> None:
         """
         Takes a list of set specification in standard form (option=value).
         Options that are known are updated immediately. If defer is true,
@@ -316,6 +644,8 @@ class OptManager:
 
         May raise an `OptionsError` if a value is malformed or an option is unknown and defer is False.
         """
+        source = _source or Source(SOURCE_SET)
+
         # First, group specs by option name.
         unprocessed: dict[str, list[str]] = {}
         for spec in specs:
@@ -338,13 +668,15 @@ class OptManager:
             self.deferred.update(
                 {k: _UnconvertedStrings(v) for k, v in unprocessed.items()}
             )
+            for k in unprocessed:
+                self._deferred_sources[k] = source
         elif unprocessed:
             raise exceptions.OptionsError(
                 f"Unknown option(s): {', '.join(unprocessed)}"
             )
 
         # Finally, apply updated options.
-        self.update(**processed)
+        self.update(_source=source, **processed)
 
     def process_deferred(self) -> None:
         """
@@ -352,14 +684,19 @@ class OptManager:
         have since been added.
         """
         update: dict[str, Any] = {}
+        sources: dict[str, Source] = {}
         for optname, value in self.deferred.items():
             if optname in self._options:
                 if isinstance(value, _UnconvertedStrings):
                     value = self._parse_setval(self._options[optname], value.val)
                 update[optname] = value
-        self.update(**update)
+                sources[optname] = self._deferred_sources.get(
+                    optname, Source(SOURCE_RUNTIME)
+                )
+        self.update_known(_sources=sources, **update)
         for k in update.keys():
             del self.deferred[k]
+            self._deferred_sources.pop(k, None)
 
     def _parse_setval(self, o: _Option, values: list[str]) -> Any:
         """
@@ -523,6 +860,72 @@ def dump_dicts(opts, keys: Iterable[str] | None = None) -> dict:
     return options_dict
 
 
+def _render_report_value(row: dict[str, Any]) -> str:
+    if row.get("sensitive"):
+        return "[set]" if row["set"] else "[not set]"
+    rendered = pprint.pformat(row["value"], compact=True)
+    return rendered if "\n" not in rendered else rendered.replace("\n", " ")
+
+
+def dump_sources(opts: OptManager, out: TextIO, key: str | None = None) -> None:
+    """
+    Write a human-readable, read-only diagnostic report describing where
+    each option's effective value comes from. When ``key`` is given, only
+    that option is reported; otherwise the report covers every option and
+    finishes with a summary of default-valued, disagreeing and
+    multi-source-same-value options.
+    """
+    if key is not None and key not in opts:
+        raise exceptions.OptionsError("No such option: %s" % key)
+    infos = {key: opts.source_info(key)} if key else opts.source_infos()
+
+    for name, info in infos.items():
+        out.write(f"{name}\n")
+        if info["sensitive"]:
+            rendered = "[set]" if info["effective_value"]["set"] else "[not set]"
+        else:
+            rendered = pprint.pformat(info["effective_value"], compact=True)
+            if "\n" in rendered:
+                rendered = rendered.replace("\n", " ")
+        out.write(f"  Effective value : {rendered}\n")
+        out.write(f"  Effective source: {info['effective_source'].describe()}\n")
+        if info["conflict"]:
+            out.write("  Note: multiple sources provide different values.\n")
+        out.write("  Sources (oldest first):\n")
+        for row in info["sources"]:
+            line = f"    {SOURCE_LABELS.get(row['category'], row['category'])}"
+            if row["location"]:
+                line += f" {row['location']}"
+            line += f" = {_render_report_value(row)}"
+            if row.get("effective"):
+                line += "  (effective)"
+            elif row["reason"]:
+                line += f"  ({row['reason']})"
+            out.write(line + "\n")
+        out.write("\n")
+
+    if key is None:
+        at_default = [n for n, i in infos.items() if i["at_default"]]
+        disagreeing = [n for n, i in infos.items() if i["conflict"]]
+        same_value = [
+            n for n, i in infos.items() if i["multiple_sources"] and not i["conflict"]
+        ]
+
+        def fmt(names: list[str]) -> str:
+            return ", ".join(names) if names else "none"
+
+        out.write("Summary:\n")
+        out.write(f"  Keys still at their default value ({len(at_default)}):\n")
+        out.write(f"    {fmt(at_default)}\n")
+        out.write(f"  Keys with disagreeing sources ({len(disagreeing)}):\n")
+        out.write(f"    {fmt(disagreeing)}\n")
+        out.write(
+            f"  Keys set by multiple sources with identical values "
+            f"({len(same_value)}):\n"
+        )
+        out.write(f"    {fmt(same_value)}\n")
+
+
 def parse(text):
     if not text:
         return {}
@@ -545,7 +948,13 @@ def parse(text):
     return data
 
 
-def load(opts: OptManager, text: str, cwd: Path | str | None = None) -> None:
+def load(
+    opts: OptManager,
+    text: str,
+    cwd: Path | str | None = None,
+    *,
+    _source: Source | None = None,
+) -> None:
     """
     Load configuration from text, over-writing options already set in
     this object. May raise OptionsError if the config file is invalid.
@@ -558,7 +967,7 @@ def load(opts: OptManager, text: str, cwd: Path | str | None = None) -> None:
             str(relative_path(Path(path), relative_to=Path(cwd))) for path in scripts
         ]
 
-    opts.update_defer(**data)
+    opts.update_defer(_source=_source or Source(SOURCE_CONFIG_FILE), **data)
 
 
 def load_paths(opts: OptManager, *paths: Path | str) -> None:
@@ -575,8 +984,9 @@ def load_paths(opts: OptManager, *paths: Path | str) -> None:
                     txt = f.read()
                 except UnicodeDecodeError as e:
                     raise exceptions.OptionsError(f"Error reading {p}: {e}")
+            source = Source(SOURCE_CONFIG_FILE, str(p))
             try:
-                load(opts, txt, cwd=p.absolute().parent)
+                load(opts, txt, cwd=p.absolute().parent, _source=source)
             except exceptions.OptionsError as e:
                 raise exceptions.OptionsError(f"Error reading {p}: {e}")
 

@@ -43,6 +43,7 @@ class ProxyAuth:
             "@path" to use an Apache htpasswd file,
             or "ldap[s]:url_server_ldap[:port]:dn_auth:password:dn_subtree[?search_filter_key=...]" for LDAP authentication.
             """,
+            sensitive=True,
         )
 
     def configure(self, updated):

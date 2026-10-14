@@ -36,7 +36,15 @@ def process_options(parser, opts, args):
     adict = {
         key: val for key, val in vars(args).items() if key in opts and val is not None
     }
-    opts.update(**adict)
+    opts.update(
+        _sources={
+            key: optmanager.Source(
+                optmanager.SOURCE_COMMAND_LINE, f"--{key.replace('_', '-')}"
+            )
+            for key in adict
+        },
+        **adict,
+    )
 
 
 T = TypeVar("T", bound=master.Master)
@@ -82,7 +90,11 @@ def run(
             sys.exit(1)
 
         try:
-            opts.set(*args.setoptions, defer=True)
+            opts.set(
+                *args.setoptions,
+                defer=True,
+                _source=optmanager.Source(optmanager.SOURCE_SET, "command line"),
+            )
             optmanager.load_paths(
                 opts,
                 os.path.join(opts.confdir, "config.yaml"),
@@ -106,7 +118,13 @@ def run(
                     logging.info(
                         f'Only processing flows that match "{" & ".join(args.filter_args)}"'
                     )
-                opts.update(**extra(args))
+                extra_opts = extra(args)
+                opts.update(
+                    _source=optmanager.Source(
+                        optmanager.SOURCE_COMMAND_LINE, "command line"
+                    ),
+                    **extra_opts,
+                )
 
         except exceptions.OptionsError as e:
             print(f"{sys.argv[0]}: {e}", file=sys.stderr)

@@ -74,6 +74,7 @@ class Loader:
         default: Any,
         help: str,
         choices: Sequence[str] | None = None,
+        sensitive: bool = False,
     ) -> None:
         """
         Add an option to mitmproxy.
@@ -81,6 +82,9 @@ class Loader:
         Help should be a single paragraph with no linebreaks - it will be
         reflowed by tools. Information on the data type should be omitted -
         it will be generated and added by tools as needed.
+
+        Set sensitive to True for credential-bearing options so that source
+        diagnostics only report whether the value is set, never its content.
         """
         assert not isinstance(choices, str)
         if name in self.master.options:
@@ -91,12 +95,15 @@ class Loader:
                 and existing.default == default
                 and existing.help == help
                 and existing.choices == choices
+                and existing.sensitive == sensitive
             )
             if same_signature:
                 return
             else:
                 logger.warning("Over-riding existing option %s" % name)
-        self.master.options.add_option(name, typespec, default, help, choices)
+        self.master.options.add_option(
+            name, typespec, default, help, choices, sensitive
+        )
 
     def add_command(self, path: str, func: Callable) -> None:
         """Add a command to mitmproxy.

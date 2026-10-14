@@ -38,6 +38,7 @@ class UpstreamAuth:
             Add HTTP Basic authentication to upstream proxy and reverse proxy
             requests. Format: username:password.
             """,
+            sensitive=True,
         )
 
     def configure(self, updated):

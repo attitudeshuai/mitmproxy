@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 from collections.abc import Sequence
@@ -47,7 +48,10 @@ class Core:
         else:
             specs = [option]
         try:
-            ctx.options.set(*specs)
+            ctx.options.set(
+                *specs,
+                _source=optmanager.Source(optmanager.SOURCE_SET, "set command"),
+            )
         except exceptions.OptionsError as e:
             raise exceptions.CommandError(e) from e
 
@@ -284,3 +288,19 @@ class Core:
             name,
             ctx.options.default(name),
         )
+
+    @command.command("options.sources")
+    def options_sources(self, option: str = "") -> str:
+        """
+        Show a read-only diagnostic report of where option values come from:
+        the effective value, its source, every overridden value and the
+        override reason. Pass an option name to report just that option,
+        otherwise all options and a summary are reported. Credential values
+        are shown only as "[set]" or "[not set]".
+        """
+        buf = io.StringIO()
+        try:
+            optmanager.dump_sources(ctx.options, buf, option or None)
+        except exceptions.OptionsError as e:
+            raise exceptions.CommandError(str(e)) from e
+        return buf.getvalue()
