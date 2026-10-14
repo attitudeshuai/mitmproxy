@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from mitmproxy import ctx
 from mitmproxy import exceptions
+from mitmproxy.addons import rewritetrace
 from mitmproxy.addons.modifyheaders import ModifySpec
 from mitmproxy.addons.modifyheaders import parse_modify_spec
 from mitmproxy.log import ALERT
@@ -14,6 +15,8 @@ logger = logging.getLogger(__name__)
 class ModifyBody:
     def __init__(self) -> None:
         self.replacements: list[ModifySpec] = []
+        # verbatim rule texts, aligned by index with self.replacements
+        self.raw_rules: list[str] = []
 
     def load(self, loader):
         loader.add_option(
@@ -30,6 +33,7 @@ class ModifyBody:
     def configure(self, updated):
         if "modify_body" in updated:
             self.replacements = []
+            self.raw_rules = []
             for option in ctx.options.modify_body:
                 try:
                     spec = parse_modify_spec(option, True)
@@ -39,6 +43,7 @@ class ModifyBody:
                     ) from e
 
                 self.replacements.append(spec)
+                self.raw_rules.append(option)
 
         stream_and_modify_conflict = (
             ctx.options.modify_body
@@ -55,32 +60,42 @@ class ModifyBody:
     def request(self, flow):
         if flow.response or flow.error or not flow.live:
             return
-        self.run(flow)
+        self.apply(flow, "request")
 
     def response(self, flow):
         if flow.error or not flow.live:
             return
-        self.run(flow)
+        self.apply(flow, "response")
 
-    def run(self, flow):
-        for spec in self.replacements:
-            if spec.matches(flow):
-                try:
-                    replacement = spec.read_replacement()
-                except OSError as e:
-                    logging.warning(f"Could not read replacement file: {e}")
-                    continue
-                if flow.response:
-                    flow.response.content = re.sub(
-                        spec.subject,
-                        lambda _: replacement,
-                        flow.response.content,
-                        flags=re.DOTALL,
-                    )
+    def apply(self, flow, phase: str, trace: rewritetrace.Recorder | None = None):
+        if trace is None:
+            trace = rewritetrace.begin("modify_body", phase, flow, self.raw_rules)
+        for i, spec in enumerate(self.replacements):
+            if not spec.matches(flow):
+                continue
+            try:
+                replacement = spec.read_replacement()
+            except OSError as e:
+                logging.warning(f"Could not read replacement file: {e}")
+                if trace is not None:
+                    trace.matched(i, error=e)
+                continue
+            message = flow.response if flow.response else flow.request
+            before = message.content
+            after = re.sub(
+                spec.subject,
+                lambda _: replacement,
+                before,
+                flags=re.DOTALL,
+            )
+            message.content = after
+            if trace is not None:
+                if after != before:
+                    trace.hit(i, detail=f"{phase} body rewritten")
                 else:
-                    flow.request.content = re.sub(
-                        spec.subject,
-                        lambda _: replacement,
-                        flow.request.content,
-                        flags=re.DOTALL,
+                    trace.matched(
+                        i,
+                        detail="flow filter matched, but the regex did not match the body",
                     )
+        if trace is not None:
+            trace.finish()

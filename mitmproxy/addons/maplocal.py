@@ -13,6 +13,7 @@ from mitmproxy import exceptions
 from mitmproxy import flowfilter
 from mitmproxy import http
 from mitmproxy import version
+from mitmproxy.addons import rewritetrace
 from mitmproxy.utils.spec import parse_spec
 
 
@@ -41,7 +42,7 @@ def parse_map_local_spec(option: str) -> MapLocalSpec:
 def _safe_path_join(root: Path, untrusted: str) -> Path:
     """Join a Path element with an untrusted str.
 
-    This is a convenience wrapper for werkzeug's safe_join,
+    This is a convenience wrapper around werkzeug's safe_join,
     raising a ValueError if the path is malformed."""
     untrusted_parts = Path(untrusted).parts
     joined = safe_join(root.as_posix(), *untrusted_parts)
@@ -82,6 +83,8 @@ def file_candidates(url: str, spec: MapLocalSpec) -> list[Path]:
 class MapLocal:
     def __init__(self) -> None:
         self.replacements: list[MapLocalSpec] = []
+        # verbatim rule texts, aligned by index with self.replacements
+        self.raw_rules: list[str] = []
 
     def load(self, loader):
         loader.add_option(
@@ -98,6 +101,7 @@ class MapLocal:
     def configure(self, updated):
         if "map_local" in updated:
             self.replacements = []
+            self.raw_rules = []
             for option in ctx.options.map_local:
                 try:
                     spec = parse_map_local_spec(option)
@@ -107,45 +111,86 @@ class MapLocal:
                     ) from e
 
                 self.replacements.append(spec)
+                self.raw_rules.append(option)
 
     def request(self, flow: http.HTTPFlow) -> None:
         if flow.response or flow.error or not flow.live:
             return
+        trace = rewritetrace.begin("map_local", "request", flow, self.raw_rules)
+        self.apply(flow, trace)
 
+    def apply(
+        self, flow: http.HTTPFlow, trace: rewritetrace.Recorder | None = None
+    ) -> None:
         url = flow.request.pretty_url
 
-        all_candidates = []
-        for spec in self.replacements:
-            if spec.matches(flow) and re.search(spec.regex, url):
-                if spec.local_path.is_file():
-                    candidates = [spec.local_path]
-                else:
-                    candidates = file_candidates(url, spec)
-                all_candidates.extend(candidates)
+        all_candidates: list[Path] = []
+        for i, spec in enumerate(self.replacements):
+            if not spec.matches(flow):
+                if trace is not None:
+                    trace.miss(i, "flow filter did not match")
+                continue
+            if not re.search(spec.regex, url):
+                if trace is not None:
+                    trace.miss(i, "flow filter matched, but the URL regex did not")
+                continue
 
-                local_file = None
-                for candidate in candidates:
-                    if candidate.is_file():
-                        local_file = candidate
-                        break
+            if spec.local_path.is_file():
+                candidates = [spec.local_path]
+            else:
+                candidates = file_candidates(url, spec)
+            if trace is not None:
+                trace.set_candidates(i, [str(c) for c in candidates])
+            all_candidates.extend(candidates)
 
-                if local_file:
-                    headers = {"Server": version.MITMPROXY}
-                    mimetype = mimetypes.guess_type(str(local_file))[0]
-                    if mimetype:
-                        headers["Content-Type"] = mimetype
+            local_file = None
+            for candidate in candidates:
+                if candidate.is_file():
+                    local_file = candidate
+                    break
 
-                    try:
-                        contents = local_file.read_bytes()
-                    except OSError as e:
-                        logging.warning(f"Could not read file: {e}")
-                        continue
+            if local_file:
+                headers = {"Server": version.MITMPROXY}
+                mimetype = mimetypes.guess_type(str(local_file))[0]
+                if mimetype:
+                    headers["Content-Type"] = mimetype
 
-                    flow.response = http.Response.make(200, contents, headers)
-                    # only set flow.response once, for the first matching rule
-                    return
+                try:
+                    contents = local_file.read_bytes()
+                except OSError as e:
+                    logging.warning(f"Could not read file: {e}")
+                    if trace is not None:
+                        trace.matched(i, error=e)
+                    continue
+
+                flow.response = http.Response.make(200, contents, headers)
+                if trace is not None:
+                    trace.hit(i, detail=f"served local file {local_file}")
+                    trace.skip_remaining(
+                        i, f"not evaluated: rule #{i} already produced a response"
+                    )
+                    trace.finish(
+                        candidates=all_candidates,
+                        selected=local_file,
+                        note="response served from a local file",
+                    )
+                # only set flow.response once, for the first matching rule
+                return
+            if trace is not None:
+                trace.matched(
+                    i, detail="rule matched, but none of the candidate files exists"
+                )
+
+        note: str | None
         if all_candidates:
             flow.response = http.Response.make(404)
+            note = "no candidate file existed, generated a 404 response"
             logging.info(
                 f"None of the local file candidates exist: {', '.join(str(x) for x in all_candidates)}"
             )
+        elif self.replacements:
+            note = "empty hit: no rule matched"
+        else:
+            note = "empty hit: no rules configured"
+        if trace is not None:
+            trace.finish(candidates=all_candidates, note=note)

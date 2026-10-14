@@ -51,6 +51,8 @@ export interface OptionsState {
     rawtcp: boolean;
     readfile_filter: string | undefined;
     request_client_cert: boolean;
+    rewrite_trace: boolean;
+    rewrite_trace_size: number;
     rfile: string | undefined;
     save_stream_file: string | undefined;
     save_stream_filter: string | undefined;
@@ -159,6 +161,8 @@ export const defaultState: OptionsState = {
     rawtcp: true,
     readfile_filter: undefined,
     request_client_cert: false,
+    rewrite_trace: false,
+    rewrite_trace_size: 1000,
     rfile: undefined,
     save_stream_file: undefined,
     save_stream_filter: undefined,

@@ -8,6 +8,7 @@ from mitmproxy import ctx
 from mitmproxy import exceptions
 from mitmproxy import flowfilter
 from mitmproxy import http
+from mitmproxy.addons import rewritetrace
 from mitmproxy.http import Headers
 from mitmproxy.utils import strutils
 from mitmproxy.utils.spec import parse_spec
@@ -56,6 +57,8 @@ def parse_modify_spec(option: str, subject_is_regex: bool) -> ModifySpec:
 class ModifyHeaders:
     def __init__(self) -> None:
         self.replacements: list[ModifySpec] = []
+        # verbatim rule texts, aligned by index with self.replacements
+        self.raw_rules: list[str] = []
 
     def load(self, loader):
         loader.add_option(
@@ -72,6 +75,7 @@ class ModifyHeaders:
     def configure(self, updated):
         if "modify_headers" in updated:
             self.replacements = []
+            self.raw_rules = []
             for option in ctx.options.modify_headers:
                 try:
                     spec = parse_modify_spec(option, False)
@@ -80,23 +84,41 @@ class ModifyHeaders:
                         f"Cannot parse modify_headers option {option}: {e}"
                     ) from e
                 self.replacements.append(spec)
+                self.raw_rules.append(option)
 
     def requestheaders(self, flow):
         if flow.response or flow.error or not flow.live:
             return
-        self.run(flow, flow.request.headers)
+        self.apply(flow, flow.request.headers, "requestheaders")
 
     def responseheaders(self, flow):
         if flow.error or not flow.live:
             return
-        self.run(flow, flow.response.headers)
+        self.apply(flow, flow.response.headers, "responseheaders")
 
-    def run(self, flow: http.HTTPFlow, hdrs: Headers) -> None:
-        matches = []
+    def apply(
+        self,
+        flow: http.HTTPFlow,
+        hdrs: Headers,
+        phase: str,
+        trace: rewritetrace.Recorder | None = None,
+    ) -> None:
+        if trace is None:
+            trace = rewritetrace.begin("modify_headers", phase, flow, self.raw_rules)
 
         # first check all the filters against the original, unmodified flow
-        for spec in self.replacements:
-            matches.append(spec.matches(flow))
+        matches = [spec.matches(flow) for spec in self.replacements]
+
+        # whether a matched header existed before the two-pass rewrite below,
+        # only needed while tracing to tell removals apart from no-ops.
+        present = (
+            [
+                matches[i] and self.replacements[i].subject in hdrs
+                for i in range(len(matches))
+            ]
+            if trace is not None
+            else []
+        )
 
         # unset all specified headers
         for i, spec in enumerate(self.replacements):
@@ -106,12 +128,34 @@ class ModifyHeaders:
         # set all specified headers if the replacement string is not empty
 
         for i, spec in enumerate(self.replacements):
-            if matches[i]:
-                try:
-                    replacement = spec.read_replacement()
-                except OSError as e:
-                    logging.warning(f"Could not read replacement file: {e}")
-                    continue
+            if not matches[i]:
+                continue
+            try:
+                replacement = spec.read_replacement()
+            except OSError as e:
+                logging.warning(f"Could not read replacement file: {e}")
+                if trace is not None:
+                    if present[i]:
+                        trace.hit(
+                            i,
+                            detail=(
+                                f"removed header {spec.subject!r}, "
+                                "but the replacement file could not be read"
+                            ),
+                            error=e,
+                        )
+                    else:
+                        trace.matched(i, error=e)
+                continue
+            if replacement:
+                hdrs.add(spec.subject, replacement)
+                if trace is not None:
+                    trace.hit(i, detail=f"set header {spec.subject!r}")
+            elif trace is not None:
+                if present[i]:
+                    trace.hit(i, detail=f"removed header {spec.subject!r}")
                 else:
-                    if replacement:
-                        hdrs.add(spec.subject, replacement)
+                    trace.matched(i, detail=f"header {spec.subject!r} was not present")
+
+        if trace is not None:
+            trace.finish()
